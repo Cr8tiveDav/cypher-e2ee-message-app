@@ -42,8 +42,14 @@
 }
 
 .chat-bubble-sender {
-  background: linear-gradient(135deg, #7c3aed 0%, #4f46e5 100%);
+  background: #0D9488;
   color: white;
+}
+
+@keyframes slide {
+  0%   { transform: translateX(-100%); }
+  50%  { transform: translateX(200%); }
+  100% { transform: translateX(-100%); }
 }
 
 .chat-bubble-recipient {

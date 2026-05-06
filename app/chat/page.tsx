@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useCrypto } from "@/lib/CryptoContext";
 import { api } from "@/lib/api";
@@ -13,9 +13,18 @@ import { WS_URL } from "@/lib/constants";
 import { Message, Conversation, UserInfo } from "@/lib/types";
 import { Sidebar } from "@/components/chat/Sidebar";
 import { ChatWindow } from "@/components/chat/ChatWindow";
+import { refreshAccessToken } from "@/utils/tokenManager";
 
 export default function ChatPage() {
-  const { user, privateKey, publicKey, accessToken, isAuthenticated, isRestoring, logout } = useCrypto();
+  const {
+    user,
+    privateKey,
+    publicKey,
+    accessToken,
+    isAuthenticated,
+    isRestoring,
+    logout,
+  } = useCrypto();
   const router = useRouter();
 
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -25,10 +34,36 @@ export default function ChatPage() {
   const [searchResults, setSearchResults] = useState<UserInfo[]>([]);
   const [inputText, setInputText] = useState("");
   const [sending, setSending] = useState(false);
-  const [ws, setWs] = useState<WebSocket | null>(null);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
 
+  // liveToken: local copy of the access token so we can refresh it without
+  // touching CryptoContext. Initialized from context once session restores.
+  const [liveToken, setLiveToken] = useState<string | null>(null);
+
+  // Refs — always current without stale-closure issues in async callbacks
+  const selectedUserRef = useRef<UserInfo | null>(null);
+  const privateKeyRef = useRef<CryptoKey | null>(null);
+  const userRef = useRef<any>(null);
+  const liveTokenRef = useRef<string | null>(null);
+
+  // Message cache: userId -> decrypted messages
+  const messageCache = useRef<Record<string, Message[]>>({});
   const messageEndRef = useRef<HTMLDivElement>(null);
 
+  // Keep refs current on every render
+  selectedUserRef.current = selectedUser;
+  privateKeyRef.current = privateKey;
+  userRef.current = user;
+  liveTokenRef.current = liveToken;
+
+  // Sync liveToken when the context token arrives (first load / login)
+  useEffect(() => {
+    if (accessToken && !liveToken) {
+      setLiveToken(accessToken);
+    }
+  }, [accessToken]);
+
+  // Redirect if session is gone (only checked after restoration)
   useEffect(() => {
     if (isRestoring) return;
     if (!isAuthenticated) {
@@ -36,116 +71,181 @@ export default function ChatPage() {
     }
   }, [isAuthenticated, isRestoring, router]);
 
+  // Load data + open WebSocket only when we have a valid live token
   useEffect(() => {
-    let socketCleanup: (() => void) | undefined;
-    if (accessToken) {
-      loadConversations();
-      socketCleanup = setupWebSocket();
-    }
-    return () => {
-      if (socketCleanup) socketCleanup();
-    };
-  }, [accessToken]);
+    if (!isAuthenticated || !liveToken) return;
 
+    loadConversations();
+    const cleanup = setupWebSocket();
+    return cleanup;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isAuthenticated, liveToken]);
+
+  // Load messages when conversation is selected
   useEffect(() => {
-    if (selectedUser) {
+    if (!selectedUser) return;
+    if (messageCache.current[selectedUser.id]) {
+      setMessages(messageCache.current[selectedUser.id]);
+    } else {
       loadMessages(selectedUser.id);
     }
   }, [selectedUser]);
 
+  // Scroll to bottom on new messages
   useEffect(() => {
     messageEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages]);
 
+  /**
+   * Wraps any API call. On 401, attempts a token refresh and retries once.
+   * If refresh fails it calls logout so the user can re-authenticate.
+   */
+  const callWithRefresh = useCallback(
+    async <T,>(fn: (token: string) => Promise<T>): Promise<T | null> => {
+      const token = liveTokenRef.current;
+      if (!token) return null;
+      try {
+        return await fn(token);
+      } catch (err: any) {
+        if (err?.status !== 401) return null;
+
+        // Token expired — attempt refresh
+        const newToken = await refreshAccessToken();
+        if (!newToken) {
+          logout();
+          return null;
+        }
+        setLiveToken(newToken);
+        liveTokenRef.current = newToken;
+
+        try {
+          return await fn(newToken);
+        } catch {
+          return null;
+        }
+      }
+    },
+    [logout]
+  );
+
   const setupWebSocket = () => {
-    if (!accessToken) return;
+    const token = liveTokenRef.current;
+    if (!token) return;
 
-    console.log("🔌 Connecting to WebSocket...");
-    const socket = new WebSocket(`${WS_URL}?token=${accessToken}`);
-
-    socket.onopen = () => {
-      console.log("✅ WebSocket Connected");
-    };
+    const socket = new WebSocket(`${WS_URL}?token=${token}`);
 
     socket.onmessage = async (event) => {
       try {
         const data = JSON.parse(event.data);
-        console.log("📩 WebSocket Message Received:", data);
 
         if (data.type === "message.receive") {
           const newMessage = data.data as Message;
-          if (privateKey) {
+
+          const pk = privateKeyRef.current;
+          const currentUser = userRef.current;
+          if (pk) {
             try {
               const plaintext = await decryptMessage(
                 newMessage.payload,
-                privateKey,
-                newMessage.from_user_id === user?.id
+                pk,
+                newMessage.from_user_id === currentUser?.id
               );
               newMessage.plaintext = plaintext;
-            } catch (e) {
-              console.error("❌ Decryption failed for incoming message", e);
+            } catch {
               newMessage.plaintext = "[Decryption Failed]";
             }
           }
 
-          if (selectedUser && (newMessage.from_user_id === selectedUser.id || newMessage.to_user_id === selectedUser.id)) {
+          const peerId =
+            newMessage.from_user_id === currentUser?.id
+              ? newMessage.to_user_id
+              : newMessage.from_user_id;
+
+          // Update cache for that peer
+          if (messageCache.current[peerId]) {
+            messageCache.current[peerId] = [
+              ...messageCache.current[peerId],
+              newMessage,
+            ];
+          }
+
+          // Append to current view — reads ref, not stale closure
+          const active = selectedUserRef.current;
+          if (
+            active &&
+            (newMessage.from_user_id === active.id ||
+              newMessage.to_user_id === active.id)
+          ) {
             setMessages((prev) => [...prev, newMessage]);
           }
-          loadConversations(); // Refresh list
+
+          // Refresh conversation list
+          const tok = liveTokenRef.current;
+          if (tok) {
+            api.get("/conversations", tok).then(setConversations).catch(() => {});
+          }
         }
-      } catch (err) {
-        console.error("❌ Error parsing WS message:", err);
+      } catch {
+        // silently ignore parse errors
       }
     };
 
-    socket.onerror = (error) => {
-      console.error("❌ WebSocket Error:", error);
+    socket.onerror = () => {};
+
+    // Reconnect automatically on unexpected close (not on intentional cleanup)
+    let intentionalClose = false;
+    socket.onclose = () => {
+      if (intentionalClose) return;
+      // Reconnect after 3 s with the latest live token
+      setTimeout(() => {
+        const newSocket = setupWebSocket();
+        // capture the cleanup so the outer return still works
+        void newSocket;
+      }, 3000);
     };
 
-    socket.onclose = (event) => {
-      console.log(`ℹ️ WebSocket Closed: ${event.reason} (${event.code})`);
-    };
-
-    setWs(socket);
     return () => {
-      console.log("🔌 Closing WebSocket...");
+      intentionalClose = true;
       socket.close();
     };
   };
 
   const loadConversations = async () => {
-    try {
-      const data = await api.get("/conversations", accessToken!);
+    await callWithRefresh(async (tok) => {
+      const data = await api.get("/conversations", tok);
       setConversations(data);
-    } catch (e) {
-      console.error("Failed to load conversations", e);
-    }
+    });
   };
 
   const loadMessages = async (userId: string) => {
-    try {
-      const data: Message[] = await api.get(`/conversations/${userId}/messages`, accessToken!);
-      const decryptedMessages = await Promise.all(
+    await callWithRefresh(async (tok) => {
+      const data: Message[] = await api.get(
+        `/conversations/${userId}/messages`,
+        tok
+      );
+      const pk = privateKeyRef.current;
+      const currentUser = userRef.current;
+      const decrypted = await Promise.all(
         data.map(async (msg) => {
-          if (privateKey) {
+          if (pk) {
             try {
               const plaintext = await decryptMessage(
                 msg.payload,
-                privateKey,
-                msg.from_user_id === user?.id
+                pk,
+                msg.from_user_id === currentUser?.id
               );
               return { ...msg, plaintext };
-            } catch (e) {
+            } catch {
               return { ...msg, plaintext: "[Decryption Failed]" };
             }
           }
           return msg;
         })
       );
-      setMessages(decryptedMessages.reverse());
-    } catch (e) {
-      console.error("Failed to load messages", e);
-    }
+      const sorted = decrypted.reverse();
+      messageCache.current[userId] = sorted;
+      setMessages(sorted);
+    });
   };
 
   const handleSearch = async (q: string) => {
@@ -154,12 +254,10 @@ export default function ChatPage() {
       setSearchResults([]);
       return;
     }
-    try {
-      const data = await api.get(`/users/search?q=${q}`, accessToken!);
+    await callWithRefresh(async (tok) => {
+      const data = await api.get(`/users/search?q=${q}`, tok);
       setSearchResults(data);
-    } catch (e) {
-      console.error("Search failed", e);
-    }
+    });
   };
 
   const handleSendMessage = async (e: React.FormEvent) => {
@@ -167,35 +265,38 @@ export default function ChatPage() {
     if (!inputText.trim() || !selectedUser || !privateKey || !publicKey) return;
 
     setSending(true);
-    try {
-      // 1. Get recipient's public key
-      const keyData = await api.get(`/users/${selectedUser.id}/public-key`, accessToken!);
+    await callWithRefresh(async (tok) => {
+      const keyData = await api.get(
+        `/users/${selectedUser.id}/public-key`,
+        tok
+      );
       const recipientPubKey = await importPublicKey(keyData.public_key);
-
-      // 2. Encrypt message
       const payload = await encryptMessage(inputText, recipientPubKey, publicKey);
 
-      // 3. Send via REST (simpler for now than WS frame)
-      const newMessage = await api.post("/messages", {
-        to: selectedUser.id,
-        payload,
-      }, accessToken!);
-
+      const newMessage = await api.post(
+        "/messages",
+        { to: selectedUser.id, payload },
+        tok
+      );
       newMessage.plaintext = inputText;
+
+      if (messageCache.current[selectedUser.id]) {
+        messageCache.current[selectedUser.id] = [
+          ...messageCache.current[selectedUser.id],
+          newMessage,
+        ];
+      }
       setMessages((prev) => [...prev, newMessage]);
       setInputText("");
       loadConversations();
-    } catch (e) {
-      console.error("Failed to send message", e);
-    } finally {
-      setSending(false);
-    }
+    });
+    setSending(false);
   };
 
   if (!isAuthenticated || isRestoring) return null;
 
   return (
-    <div className="flex h-screen bg-[#020617] text-slate-100 font-sans overflow-hidden">
+    <div className="flex h-dvh bg-[#020617] text-slate-100 font-sans overflow-hidden relative">
       <Sidebar
         user={user}
         conversations={conversations}
@@ -206,6 +307,8 @@ export default function ChatPage() {
         searchResults={searchResults}
         handleSearch={handleSearch}
         logout={logout}
+        isOpen={isSidebarOpen}
+        onClose={() => setIsSidebarOpen(false)}
       />
       <ChatWindow
         selectedUser={selectedUser}
@@ -216,6 +319,7 @@ export default function ChatPage() {
         handleSendMessage={handleSendMessage}
         sending={sending}
         messageEndRef={messageEndRef}
+        onOpenSidebar={() => setIsSidebarOpen(true)}
       />
     </div>
   );
