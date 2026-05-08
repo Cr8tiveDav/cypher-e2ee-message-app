@@ -26,22 +26,22 @@ export interface AuthResponse {
 
 export const authService = {
   async register(username: string, displayName: string, password: string): Promise<AuthResponse & { privateKey: CryptoKey }> {
-    // 1. Generate Identity Key Pair
+    // Generate Identity Key Pair
     const keyPair = await generateIdentityKeyPair();
 
-    // 2. Generate Salt for PBKDF2
+    // Generate Salt for PBKDF2
     const salt = crypto.getRandomValues(new Uint8Array(16));
 
-    // 3. Derive Wrapping Key from Password
+    // Derive Wrapping Key from Password
     const wrappingKey = await deriveWrappingKey(password, salt.buffer);
 
-    // 4. Wrap Private Key
+    // Wrap Private Key
     const wrappedPrivateKey = await wrapPrivateKey(keyPair.privateKey, wrappingKey);
 
-    // 5. Export Public Key
+    // Export Public Key
     const publicKeyBase64 = await exportPublicKey(keyPair.publicKey);
 
-    // 6. Register with Backend
+    // Register with Backend
     const response = await api.post("/auth/register", {
       username,
       display_name: displayName,

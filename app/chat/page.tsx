@@ -81,7 +81,7 @@ export default function ChatPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isAuthenticated, liveToken]);
 
-  // Load messages when conversation is selected
+  // Load messages when conversation is selected, and poll as fallback
   useEffect(() => {
     if (!selectedUser) return;
     if (messageCache.current[selectedUser.id]) {
@@ -89,6 +89,14 @@ export default function ChatPage() {
     } else {
       loadMessages(selectedUser.id);
     }
+
+    // Fallback polling: The WhisperBox backend WS does not currently push message.receive events reliably.
+    const interval = setInterval(() => {
+      loadMessages(selectedUser.id, true);
+    }, 3000);
+
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedUser]);
 
   // Scroll to bottom on new messages
@@ -132,14 +140,17 @@ export default function ChatPage() {
     const token = liveTokenRef.current;
     if (!token) return;
 
+    // Connect WebSocket with token in query parameter
     const socket = new WebSocket(`${WS_URL}?token=${token}`);
+    let intentionalClose = false;
 
     socket.onmessage = async (event) => {
       try {
         const data = JSON.parse(event.data);
+        console.log("WebSocket Event Received:", data);
 
-        if (data.type === "message.receive") {
-          const newMessage = data.data as Message;
+        if (data.event === "message.receive") {
+          const newMessage = data.data ? data.data : data;
 
           const pk = privateKeyRef.current;
           const currentUser = userRef.current;
@@ -192,15 +203,16 @@ export default function ChatPage() {
 
     socket.onerror = () => {};
 
-    // Reconnect automatically on unexpected close (not on intentional cleanup)
-    let intentionalClose = false;
+    // Reconnect automatically on unexpected close
     socket.onclose = () => {
       if (intentionalClose) return;
-      // Reconnect after 3 s with the latest live token
+
+      // Auto-reconnect after 3s using the latest token
       setTimeout(() => {
-        const newSocket = setupWebSocket();
-        // capture the cleanup so the outer return still works
-        void newSocket;
+        if (!intentionalClose) {
+          const newSocket = setupWebSocket();
+          void newSocket; // Keeps the reference active internally
+        }
       }, 3000);
     };
 
@@ -217,18 +229,35 @@ export default function ChatPage() {
     });
   };
 
-  const loadMessages = async (userId: string) => {
+  const loadMessages = async (userId: string, isPolling = false) => {
     await callWithRefresh(async (tok) => {
       const data: Message[] = await api.get(
         `/conversations/${userId}/messages`,
         tok
       );
+
+      const currentCache = messageCache.current[userId] || [];
+
+      // Optimization: Skip expensive decryption if the message list hasn't changed
+      if (isPolling && data.length > 0 && currentCache.length === data.length) {
+        // data[0] is the newest message from backend
+        if (currentCache[currentCache.length - 1]?.id === data[0].id) {
+          return;
+        }
+      }
+
       const pk = privateKeyRef.current;
       const currentUser = userRef.current;
       const decrypted = await Promise.all(
         data.map(async (msg) => {
           if (pk) {
             try {
+              // Only decrypt if we haven't already decrypted it in cache
+              const cachedMsg = currentCache.find((c) => c.id === msg.id);
+              if (cachedMsg && cachedMsg.plaintext) {
+                return cachedMsg;
+              }
+
               const plaintext = await decryptMessage(
                 msg.payload,
                 pk,
@@ -262,23 +291,29 @@ export default function ChatPage() {
 
   const handleSendMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!inputText.trim() || !selectedUser || !privateKey || !publicKey) return;
+    const currentInput = inputText.trim();
+    if (!currentInput || !selectedUser || !privateKey || !publicKey) return;
 
     setSending(true);
-    await callWithRefresh(async (tok) => {
+    setInputText(""); // Clear immediately for snappy UI
+
+    const success = await callWithRefresh(async (tok) => {
       const keyData = await api.get(
         `/users/${selectedUser.id}/public-key`,
         tok
       );
       const recipientPubKey = await importPublicKey(keyData.public_key);
-      const payload = await encryptMessage(inputText, recipientPubKey, publicKey);
+      const payload = await encryptMessage(currentInput, recipientPubKey, publicKey);
 
-      const newMessage = await api.post(
+      const response = await api.post(
         "/messages",
         { to: selectedUser.id, payload },
         tok
       );
-      newMessage.plaintext = inputText;
+
+      // Extract data if the backend wraps it in { data: ... }
+      const newMessage = response.data ? response.data : response;
+      newMessage.plaintext = currentInput;
 
       if (messageCache.current[selectedUser.id]) {
         messageCache.current[selectedUser.id] = [
@@ -287,12 +322,16 @@ export default function ChatPage() {
         ];
       }
       setMessages((prev) => [...prev, newMessage]);
-      setInputText("");
       loadConversations();
+      return true;
     });
+
+    if (!success) {
+      // Revert if API failed
+      setInputText(currentInput);
+    }
     setSending(false);
   };
-
   if (!isAuthenticated || isRestoring) return null;
 
   return (

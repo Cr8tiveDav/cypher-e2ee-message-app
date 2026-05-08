@@ -114,7 +114,10 @@ export default function AuthPage() {
           <p className="text-slate-500 text-sm font-medium">
             {isLogin ? "Don't have an account?" : "Already have an account?"}{" "}
             <button
-              onClick={() => setIsLogin(!isLogin)}
+              onClick={() => {
+                setIsLogin(!isLogin);
+                setError("");
+              }}
               className="text-slate-100 font-bold cursor-pointer hover:underline underline-offset-4"
             >
               {isLogin ? "Sign up" : "Log in"}
